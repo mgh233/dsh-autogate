@@ -1,7 +1,21 @@
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useEffect, useRef, useState } from 'react'
+import type { PermissionSelection } from '@deepseek-ai/dsh-permission-presets/types'
 import { ApiSettingsSource, BUNDLE_CONFIG_SLOT, BUNDLE_PACKAGE_NAME, CardForm, SETTINGS_NS, TRAIL_ENDPOINT, TrailController, boolField, en, formatDuration, formatTime, modelsFromCatalog, numberField, pairedReset, selectField, textField, zh } from './client-logic.js'
 import type { TrailFetcher } from './client-logic.js'
+
+function permissionIconMask(symbol: string): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5 13.5 4v3.5c0 3.2-2.2 5.5-5.5 7-3.3-1.5-5.5-3.8-5.5-7V4L8 1.5Z"/>${symbol}</svg>`
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") center / contain no-repeat`
+}
+
+const permissionIconAttribute = 'data-autogate-permission-icon'
+const permissionIconSelector = `[${permissionIconAttribute}]`
+const currentPermissionAttribute = 'data-autogate-current-permission'
+const permissionTriggerSelector = 'span[style*="anchor-name"] > button[class$="_trigger"]:has(> span[class$="_triggerLabel"])'
+const currentPermissionIconSelector = `[data-composer-card]:has(> [data-composer-overlay] [${currentPermissionAttribute}]) ${permissionTriggerSelector}:not(:has(> span[class$="_triggerIcon"]))`
+const askIcon = permissionIconMask('<path d="M6.5 6.4a1.5 1.5 0 1 1 2.6 1C8.5 8 8 8.2 8 9m0 2h.01"/>')
+const fullIcon = permissionIconMask('<path fill="black" stroke="none" d="M8.9 4.3 5.6 8.5h2L7 11.9l3.4-4.6H8.3l.6-3Z"/>')
 
 // ==== 卡片样式（复用 DSH 主题变量，运行时注入） ====
 const CSS = `.sa_form{flex-direction:column;display:flex}
@@ -80,7 +94,12 @@ const CSS = `.sa_form{flex-direction:column;display:flex}
 .sa_comboCaret{position:absolute;right:10px;top:50%;transform:translateY(-50%);pointer-events:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:1}
 .sa_comboList{position:absolute;z-index:40;top:calc(100% + 4px);left:0;right:0;margin:0;padding:4px;list-style:none;max-height:240px;overflow:auto;background:var(--dsw-alias-bg-layer-3);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:0 8px 24px #00000026}
 .sa_comboItem button{display:block;width:100%;padding:6px 10px;border:0;background:0 0;text-align:left;font:inherit;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-primary);border-radius:6px;cursor:pointer}
-.sa_comboItem button:hover{background:var(--dsw-alias-bg-module-platform)}`
+.sa_comboItem button:hover{background:var(--dsw-alias-bg-module-platform)}
+[${permissionIconAttribute}="auto-ask"],[data-composer-card]:has(> [data-composer-overlay] [${currentPermissionAttribute}="auto-ask"]){--dsh-autogate-permission-mask:${askIcon}}
+[${permissionIconAttribute}="auto-full"],[data-composer-card]:has(> [data-composer-overlay] [${currentPermissionAttribute}="auto-full"]){--dsh-autogate-permission-mask:${fullIcon}}
+${permissionIconSelector}::before,${currentPermissionIconSelector}::before{content:"";width:14px;height:14px;flex:none;pointer-events:none;background-color:currentColor;mask:var(--dsh-autogate-permission-mask)}
+${permissionIconSelector}::before{background-color:var(--dsw-alias-menu-icon,currentColor)}
+@media(forced-colors:active){${permissionIconSelector}::before,${currentPermissionIconSelector}::before{background-color:ButtonText;forced-color-adjust:none}}`
 
 function injectCss() {
   const tagId = 'dsh-autogate/client.css'
@@ -91,6 +110,95 @@ function injectCss() {
     tag.textContent = CSS
     document.head.appendChild(tag)
   }
+}
+
+// 宿主的权限菜单通过 CSS 锚点连接到输入区权限按钮，目录顺序与菜单项顺序一致。
+function isComposerPermissionMenu(menu: HTMLElement): boolean {
+  if (!menu.matches('[role="menu"][data-anchor-side="top"]')) return false
+  const anchor = menu.style.getPropertyValue('position-anchor')
+  if (!anchor.startsWith('--dsh-menu-trigger-')) return false
+  const triggers = document.querySelectorAll<HTMLButtonElement>(`[data-composer-card] ${permissionTriggerSelector}`)
+  return Array.from(triggers).some(button => button.parentElement?.style.getPropertyValue('anchor-name') === anchor)
+}
+
+type PermissionOption = { readonly value: string; readonly name: string }
+
+function isAutogatePreset(value: string | undefined): value is 'auto-ask' | 'auto-full' {
+  return value === 'auto-ask' || value === 'auto-full'
+}
+
+function isPermissionOption(option: unknown): option is PermissionOption {
+  return typeof option === 'object' && option !== null
+    && 'value' in option && typeof option.value === 'string'
+    && 'name' in option && typeof option.name === 'string'
+}
+
+function permissionOptions(result: unknown): readonly PermissionOption[] | undefined {
+  if (typeof result !== 'object' || result === null || !('ok' in result) || result.ok !== true
+    || !('value' in result) || typeof result.value !== 'object' || result.value === null
+    || !('options' in result.value)) return
+  const { options } = result.value
+  if (Array.isArray(options) && options.every(isPermissionOption)) return options
+}
+
+function observePermissionMenuIcons(readCatalog: () => Promise<unknown>): (() => void) | undefined {
+  if (typeof document === 'undefined' || !document.body) return
+  const { body } = document
+  const marked = new Set<HTMLButtonElement>()
+  let disposed = false
+
+  async function decorate(menu: HTMLElement) {
+    try {
+      const options = permissionOptions(await readCatalog())
+      if (options === undefined || disposed || menu.parentElement !== body || !menu.isConnected) return
+      const rows = menu.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]')
+      if (rows.length !== options.length) return
+      options.forEach(({ value, name }, index) => {
+        if (!isAutogatePreset(value)) return
+        const row = rows[index]
+        if (row.querySelector(':scope > span[class*="_itemIcon_"]')) return
+        // 内置权限档有独立翻译，自定义档按宿主的 displayPresetName 规则显示。
+        const label = /^[a-z0-9]+(-[a-z0-9]+)*$/.test(name)
+          ? name.split('-').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ')
+          : name
+        if (row.querySelector(':scope > span[class*="_itemLabel_"]')?.textContent !== label) return
+        row.setAttribute(permissionIconAttribute, value)
+        marked.add(row)
+      })
+    } catch {
+      // 目录不可用时保留宿主菜单。
+    }
+  }
+
+  const observer = new MutationObserver(records => {
+    for (const row of marked) {
+      if (body.contains(row)) continue
+      row.removeAttribute(permissionIconAttribute)
+      marked.delete(row)
+    }
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node instanceof HTMLElement && node.parentElement === body && isComposerPermissionMenu(node)) {
+          void decorate(node)
+        }
+      }
+    }
+  })
+  observer.observe(body, { childList: true })
+  return () => {
+    disposed = true
+    observer.disconnect()
+    for (const row of marked) row.removeAttribute(permissionIconAttribute)
+    marked.clear()
+  }
+}
+
+// 从同一会话的权限投影订阅当前预设，供输入框按钮的样式读取。
+function CurrentPermissionIcon({ useProjection }: {
+  useProjection: (key: 'permissions') => PermissionSelection | undefined
+}) {
+  const preset = useProjection('permissions')?.currentValue
+  return isAutogatePreset(preset) ? jsx('span', { hidden: true, [currentPermissionAttribute]: preset }) : null
 }
 
 // ==== SafeAutoCardController ====
@@ -603,6 +711,13 @@ const inject = ['slots', 'locale', 'connection', 'sessions', 'uiSession', 'remot
 
 function apply(ctx: any) {
   injectCss()
+  ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register({
+    name: 'conversation.input.overlay',
+    id: 'autogate-current-permission-icon',
+  }, CurrentPermissionIcon))
+  ctx.inject(['remote.permissionPresets'], (child: typeof ctx) => {
+    child.effect(() => observePermissionMenuIcons(() => child.remote.permissionPresets.catalog()), 'autogate: permission menu icons')
+  })
   ctx.effect(() => ctx.locale.register(SETTINGS_NS, { zh, en }), 'autogate: card dictionaries')
   // 轨迹拉取器：DSH 0.1.5 起 connection.rpc.handle 在服务端注册失效（见 index.ts 迁移说明），
   // 审批轨迹端点改为 POST /api/autogate/trail 的 HTTP fetch；此处适配成 TrailController 的 call 契约。
