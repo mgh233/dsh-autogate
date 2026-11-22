@@ -82,6 +82,7 @@ DeepSeek Harness 自动审批插件：在 **workspace-write 沙箱之上** 增�
       showTrail: true                  # 审批轨迹浮窗开关：false 隐藏右下角浮窗并停止轮询轨迹接口（默认显示）
       presetName: auto-ask             # 半自动模式预设键（默认 auto-ask）：LLM 拒绝后转人工兜底弹窗
       fullAutoPresetName: auto-full         # 全自动模式预设键（默认 auto-full）：LLM 裁决为最终决定，不再人工弹窗
+      returnDenialReason: true             # 全自动拒绝时向 Agent 回传具体审查理由（默认开启，关闭后仅返回通用提示）
       classifierTimeoutMs: 8000        # 分类器超时（100–60000ms），超时 fail-closed
       classifierMaxOutputTokens: 1024  # 分类器输出上限（64–4096）
       classifierRetry: true            # 分类器输出解析失败时静默重试一次（默认开启）

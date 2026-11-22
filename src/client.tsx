@@ -1,6 +1,6 @@
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useEffect, useRef, useState } from 'react'
-import { ApiSettingsSource, BUNDLE_CONFIG_SLOT, BUNDLE_PACKAGE_NAME, CardForm, SETTINGS_NS, TRAIL_ENDPOINT, TrailController, boolField, en, formatDuration, formatTime, modelsFromCatalog, numberField, pairedReset, pairedResetField, selectField, textField, zh } from './client-logic.js'
+import { ApiSettingsSource, BUNDLE_CONFIG_SLOT, BUNDLE_PACKAGE_NAME, CardForm, SETTINGS_NS, TRAIL_ENDPOINT, TrailController, boolField, en, formatDuration, formatTime, modelsFromCatalog, numberField, pairedReset, selectField, textField, zh } from './client-logic.js'
 import type { TrailFetcher } from './client-logic.js'
 
 // ==== 卡片样式（复用 DSH 主题变量，运行时注入） ====
@@ -110,6 +110,7 @@ class SafeAutoCardController {
     this.form = new CardForm(settingsSource, [
       textField('presetName'),
       textField('fullAutoPresetName'),
+      boolField('returnDenialReason'),
       selectField('classifierProvider'),
       selectField('classifierModel'),
       textField('classifierEndpoint'),
@@ -132,6 +133,7 @@ class SafeAutoCardController {
       ...this.form.shell(),
       presetName: this.form.field('presetName'),
       fullAutoPresetName: this.form.field('fullAutoPresetName'),
+      returnDenialReason: this.form.field('returnDenialReason'),
       classifierProvider: this.form.field('classifierProvider'),
       classifierModel: this.form.field('classifierModel'),
       classifierEndpoint: this.form.field('classifierEndpoint'),
@@ -254,11 +256,13 @@ class SafeAutoCardController {
 
 // ==== UI 组件 ====
 function ValueField(props: any) {
+  const hintId = props.id + '-hint'
   const control = props.bool
     ? jsx('input', {
         id: props.id,
         className: 'sa_bool',
         type: 'checkbox',
+        'aria-describedby': hintId,
         checked: props.text === 'true',
         disabled: props.disabled,
         onChange: (event: any) => props.onEdit(event.target.checked ? 'true' : 'false'),
@@ -311,7 +315,7 @@ function ValueField(props: any) {
         ],
       }),
       control,
-      jsx('p', { className: props.invalid ? 'sa_invalid' : 'sa_hint', children: props.invalid ? props.invalidLabel : props.hint }),
+      jsx('p', { id: hintId, className: props.invalid ? 'sa_invalid' : 'sa_hint', children: props.invalid ? props.invalidLabel : props.hint }),
     ],
   })
 }
@@ -415,6 +419,7 @@ function SafeAutoCard(props: any) {
     { key: 'preflight', label: t('preflight'), hint: t('preflightHint'), bool: true },
     { key: 'presetName', label: t('presetName'), hint: t('presetNameHint') },
     { key: 'fullAutoPresetName', label: t('fullAutoPresetName'), hint: t('fullAutoPresetNameHint') },
+    { key: 'returnDenialReason', label: t('returnDenialReason'), hint: t('returnDenialReasonHint'), bool: true },
     { key: 'classifierProvider', label: t('classifierProvider'), hint: t('classifierProviderHint'), combo: true },
     { key: 'classifierModel', label: t('classifierModel'), hint: t('classifierModelHint'), combo: true },
     { key: 'classifierEndpoint', label: t('classifierEndpoint'), hint: t('classifierEndpointHint') },
@@ -599,7 +604,6 @@ const inject = ['slots', 'locale', 'connection', 'sessions', 'uiSession', 'remot
 function apply(ctx: any) {
   injectCss()
   ctx.effect(() => ctx.locale.register(SETTINGS_NS, { zh, en }), 'autogate: card dictionaries')
-  const t = ctx.locale.bind(SETTINGS_NS)
   // 轨迹拉取器：DSH 0.1.5 起 connection.rpc.handle 在服务端注册失效（见 index.ts 迁移说明），
   // 审批轨迹端点改为 POST /api/autogate/trail 的 HTTP fetch；此处适配成 TrailController 的 call 契约。
   const trailFetcher: TrailFetcher = {

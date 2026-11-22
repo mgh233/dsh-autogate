@@ -40,6 +40,9 @@ export interface ClassifierDecision {
   usage?: ClassifierTokenUsage
 }
 
+/** 可安全回传给 Agent 的分类器故障类别。 */
+export type ClassifierFailureKind = 'timeout' | 'service' | 'format'
+
 /** 安全分类器接口：默认走 DSH 内部 LLM，可替换为独立 HTTP 端点。 */
 export interface SafetyClassifier {
   classify(input: ClassifierInput, signal: AbortSignal): Promise<ClassifierDecision>

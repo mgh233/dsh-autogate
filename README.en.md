@@ -66,6 +66,7 @@ Configuration is wired through the DSH settings service (`ctx.settings`): write 
       showTrail: true                  # approval trail overlay switch: false hides the bottom-right panel and stops polling the trail RPC (default true)
       presetName: auto-ask             # semi-auto preset key (default auto-ask): delegates to a human fallback popup after LLM deny
       fullAutoPresetName: auto         # full-auto preset key (default auto): LLM decision is final, no human popup
+      returnDenialReason: true         # send detailed full-auto denial reasons to the agent (default true; false keeps the generic message)
       classifierTimeoutMs: 8000        # classifier timeout (100–60000ms), fail-closed on timeout
       classifierMaxOutputTokens: 1024  # classifier max output tokens (64–4096)
       classifierRetry: true            # retry once on classifier output parse failure (default true)
