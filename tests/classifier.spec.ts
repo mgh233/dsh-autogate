@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { setTimeout } from 'node:timers/promises'
 import { CLASSIFIER_SYSTEM_PROMPT, createDshClassifier, createHttpClassifier, extractEscalationJustification, isEscalationApprovalReason, parseClassifierDecision, sanitizeClassifierArguments, sanitizeClassifierText, sanitizeClassifierTextTail, withLocaleDirective } from '../src/classifier.js'
 
 describe('withLocaleDirective', () => {
@@ -211,6 +212,18 @@ describe('createDshClassifier 异常路径', () => {
     const classifier = createDshClassifier(runtime, { timeoutMs: 1000 })
     await expect(classifier.classify(routedInput as any, new AbortController().signal)).rejects.toThrow('finish')
   })
+
+  it.each([
+    ['TIMEOUT', 'timeout'], ['SERVER', 'service'], ['MALFORMED_RESPONSE', 'format'],
+  ])('使用 DSH 的 %s 故障码识别类别', async (code, kind) => {
+    const runtime = {
+      async *stream() {
+        yield { type: 'finish', reason: { kind: 'error', failure: { code, message: '合成服务诊断' } } } as const
+      },
+    }
+    const classifier = createDshClassifier(runtime, { timeoutMs: 1_000 })
+    await expect(classifier.classify(routedInput, new AbortController().signal)).rejects.toMatchObject({ kind })
+  })
 })
 
 describe('createDshClassifier 解析失败重试', () => {
@@ -375,12 +388,25 @@ describe('createHttpClassifier HTTP 端点', () => {
   it('非 200 响应抛错', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('err', { status: 500 })))
     const classifier = createHttpClassifier({ endpoint: 'https://api.example.com/v1/chat/completions', model: 'm', timeoutMs: 1000 })
-    await expect(classifier.classify(input as any, new AbortController().signal)).rejects.toThrow('HTTP 500')
+    await expect(classifier.classify(input, new AbortController().signal)).rejects.toMatchObject({ kind: 'service', message: 'classifier HTTP 500' })
   })
   it('choices 为空抛错', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => okResponse({ choices: [] })))
     const classifier = createHttpClassifier({ endpoint: 'https://api.example.com/v1/chat/completions', model: 'm', timeoutMs: 1000 })
-    await expect(classifier.classify(input as any, new AbortController().signal)).rejects.toThrow('one choice')
+    await expect(classifier.classify(input, new AbortController().signal)).rejects.toMatchObject({ kind: 'format', message: expect.stringContaining('one choice') })
+  })
+  it('HTTP 响应正文不是 JSON 时归类为格式错误', async () => {
+    const fetch = vi.fn(async () => new Response('not-json'))
+    vi.stubGlobal('fetch', fetch)
+    const classifier = createHttpClassifier({ endpoint: 'https://api.example.com/v1/chat/completions', model: 'm', timeoutMs: 1_000, retryOnFailure: true })
+    await expect(classifier.classify(input, new AbortController().signal)).rejects.toMatchObject({ kind: 'format' })
+    expect(fetch).toHaveBeenCalledOnce()
+  })
+  it('HTTP 请求超过本地期限时归类为超时', async () => {
+    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) =>
+      setTimeout(1_000, okResponse({}), { signal: init.signal ?? undefined }))
+    const classifier = createHttpClassifier({ endpoint: 'https://api.example.com/v1/chat/completions', model: 'm', timeoutMs: 10 })
+    await expect(classifier.classify(input, new AbortController().signal)).rejects.toMatchObject({ kind: 'timeout' })
   })
   it('deny 决策透传', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => okResponse({ choices: [{ message: { content: '{"decision":"deny","reason":"danger"}' } }] })))

@@ -1,5 +1,5 @@
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
-import type { ClassifierDecision, SafetyClassifier } from './types.js';
+import type { ClassifierDecision, ClassifierFailureKind, SafetyClassifier } from './types.js';
 import type { UiLocale } from './i18n.js';
 /**
  * 消息来源声明。DSH 0.1.7 起 MessageSourceMap 不再有通用的 `plugin` 兜底 kind，
@@ -45,6 +45,11 @@ export interface DshClassifierConfig {
 }
 interface LlmStreamRuntime {
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+}
+/** 结构化故障类别供反馈使用，诊断原文留给日志。 */
+export declare class ClassifierFailure extends Error {
+    readonly kind: ClassifierFailureKind;
+    constructor(kind: ClassifierFailureKind, cause: unknown);
 }
 export declare function createDshClassifier(runtime: LlmStreamRuntime, config: DshClassifierConfig): SafetyClassifier;
 /** 独立 OpenAI 兼容分类器（可选；必须 HTTPS 或 loopback HTTP）。 */

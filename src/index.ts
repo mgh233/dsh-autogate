@@ -3,7 +3,7 @@ import z from '@deepseek-ai/schemastery'
 import { z as zod } from 'zod'
 import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { CLASSIFIER_SYSTEM_PROMPT, createDshClassifier, createHttpClassifier, extractEscalationJustification, isEscalationApprovalReason, sanitizeClassifierArguments, sanitizeClassifierText, sanitizeClassifierTextTail } from './classifier.js'
+import { CLASSIFIER_SYSTEM_PROMPT, ClassifierFailure, createDshClassifier, createHttpClassifier, extractEscalationJustification, isEscalationApprovalReason, sanitizeClassifierArguments, sanitizeClassifierText, sanitizeClassifierTextTail } from './classifier.js'
 import { resolveRoots, type RootOptions } from './paths.js'
 import { assessTool, hardDenyReason, isSandboxEscalationRetry, summarizeToolArguments } from './policy.js'
 import { setApprovalPolicy, type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
@@ -22,6 +22,7 @@ import type { ProjectionDefinition, ProjectionHandle } from '@deepseek-ai/dsh-se
 import type {} from '@deepseek-ai/dsh-tool-executor-ptc/types'
 import type { ClassifierInput, ClassifierTokenUsage, ManagedMode, SafetyClassifier } from './types.js'
 import { createApprovalTrail, type ApprovalDecision, type ApprovalLayer } from './trail.js'
+import { classifierFailureFeedback, createApprovalFeedback } from './approval-feedback.js'
 import type { UiLocale } from './i18n.js'
 
 export * from './paths.js'
@@ -124,6 +125,8 @@ export interface Config {
   readonly showTrail: Volatile<boolean>
   /** 全自动权限预设键（默认 auto-full）：该预设下审批不再人工弹窗，LLM 裁决为最终决定。 */
   readonly fullAutoPresetName: Volatile<string>
+  /** 全自动审批拒绝时，是否把具体审查理由回传给 Agent。 */
+  readonly returnDenialReason: Volatile<boolean>
 }
 
 // 注意：不能再写显式标注 `z<Config>` —— volatile 字段把 schema 的 mode 从 plain 改为
@@ -148,6 +151,7 @@ export const Config = z.object({
   preflight: z.boolean().default(false).description('沙盒前拦截判断开关：开启执行确定性规则与 LLM 分类，关闭则完全依赖沙盒策略（硬 deny 与提权审批不受影响）').volatile(),
   showTrail: z.boolean().default(true).description('审批轨迹浮窗开关：默认显示；关闭则不显示浮窗且客户端停止轮询轨迹接口').volatile(),
   fullAutoPresetName: z.string().default(AUTO_PERMISSION_PRESET).description('全自动权限预设键（默认 auto-full）：该预设下审批不再人工弹窗，LLM 裁决为最终决定').volatile(),
+  returnDenialReason: z.boolean().default(true).description('全自动审批拒绝时将具体审查理由回传给 Agent').volatile(),
 })
 
 /**
@@ -171,7 +175,6 @@ interface ResolvedConfig {
   proposalContextMaxChars?: number
   proposalContextMaxTotalChars?: number
   preflight?: boolean
-  showTrail?: boolean
   fullAutoPresetName?: string
 }
 
@@ -200,7 +203,6 @@ function resolveConfig(config: Partial<Config>): ResolvedConfig {
     proposalContextMaxChars: config.proposalContextMaxChars?.get(),
     proposalContextMaxTotalChars: config.proposalContextMaxTotalChars?.get(),
     preflight: config.preflight?.get(),
-    showTrail: config.showTrail?.get(),
     fullAutoPresetName: config.fullAutoPresetName?.get(),
   }
 }
@@ -771,6 +773,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
 
   // 审批轨迹：进程级环形缓冲，记录每次 Auto 决策供客户端面板拉取展示。
   const trail = createApprovalTrail()
+  const approvalFeedback = createApprovalFeedback(ctx, () => config.returnDenialReason?.get() ?? true)
 
   // ApprovalRequest 不携带 arguments：pre-execute 阶段缓存原始参数，approval/request 阶段按 callId 取回，
   // 供分类器判断具体目标。缓存同时覆盖沙箱提权重试与工具自身声明需要审批（ask）两类请求。
@@ -988,7 +991,8 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
       const message = error instanceof Error ? error.message : String(error)
       ctx.logger.warn('autogate: L1 分类器异常，拒绝操作（工具: ' + exec.name + '）', error)
       recordTrail(exec, authority, 'deny', 'L1', message, Date.now() - startedAt)
-      return { kind: 'deny', reason: '[autogate classifier unavailable] ' + message }
+      const failure = error instanceof ClassifierFailure ? error.kind : undefined
+      return { kind: 'deny', reason: '[autogate classifier unavailable] ' + classifierFailureFeedback(failure) }
     }
   })
 
@@ -1001,6 +1005,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     const authority = authorityOf(req.agent)
     if (authority === undefined) return next()
     const mode = authority.mode
+    const recordFeedback = mode === 'full-auto' ? approvalFeedback.capture(req) : undefined
     // 子代理（origin=subagent）无可靠人工弹窗通道：其一切审批（沙箱提权 + 工具自身 ask）LLM 终审拒绝即拒绝，不转人工兜底。
     const subagentDenyFinal = req.agent?.session?.header?.origin === 'subagent'
     // 审批耗时：审批请求从进入本监听器到 LLM 预审得出结论的墙钟毫秒数。
@@ -1045,11 +1050,13 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
         return 'allowed-once'
       }
       recordTrailEntry({ callId, toolName: req.toolName, summary, decision: (mode === 'full-auto' || subagentDenyFinal) ? 'deny' : 'ask', layer: 'L2', reason: decision.reason, durationMs: Date.now() - startedAt, sessionId: sessionIdOf(authority.agent), execSessionId: sessionIdOf(req.agent), classifierInput, tokenUsage: decision.usage })
+      recordFeedback?.({ kind: 'denied', reason: decision.reason })
     } catch (error: unknown) {
       // 分类器异常：半自动 fail-closed 到人工弹窗；全自动直接拒绝。保留具体错误并写日志，便于上报排查。
       const message = error instanceof Error ? error.message : String(error)
       ctx.logger.warn('autogate: L2 审批预审分类器异常（工具: ' + req.toolName + '）', error)
       recordTrailEntry({ callId, toolName: req.toolName, summary, decision: (mode === 'full-auto' || subagentDenyFinal) ? 'deny' : 'ask', layer: 'L2', reason: 'classifier unavailable: ' + message, durationMs: Date.now() - startedAt, sessionId: sessionIdOf(authority.agent), execSessionId: sessionIdOf(req.agent) })
+      recordFeedback?.({ kind: 'unavailable', failure: error instanceof ClassifierFailure ? error.kind : undefined })
     }
     // 全自动与子代理：LLM 裁决为最终决定，直接拒绝不再人工弹窗；半自动主代理：委派人工兜底。
     if (mode === 'full-auto' || subagentDenyFinal) return 'rejected'

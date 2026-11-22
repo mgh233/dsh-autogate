@@ -29,7 +29,7 @@ const CONFIG_FIELDS = [
   'presetName', 'workspaceRoot', 'tempRoots', 'classifierEndpoint', 'classifierProvider', 'classifierModel',
   'classifierPrompt', 'classifierApiKeyEnv', 'classifierTimeoutMs', 'classifierMaxOutputTokens', 'classifierRetry',
   'classifierHttpDisableReasoning', 'proposalContextMaxMessageLen', 'proposalContextMaxChars',
-  'proposalContextMaxTotalChars', 'preflight', 'showTrail', 'fullAutoPresetName',
+  'proposalContextMaxTotalChars', 'preflight', 'showTrail', 'fullAutoPresetName', 'returnDenialReason',
 ] as const
 
 /**
@@ -222,6 +222,11 @@ describe('Config schema 默认值', () => {
 
   it('showTrail 默认显示（true）', () => {
     expect(Config({}).showTrail.get()).toBe(true)
+  })
+
+  it('拒绝理由回传默认开启，可明确关闭', () => {
+    expect(Config({}).returnDenialReason.get()).toBe(true)
+    expect(Config({ returnDenialReason: false }).returnDenialReason.get()).toBe(false)
   })
 
   it('preflight 默认关闭（false）', () => {

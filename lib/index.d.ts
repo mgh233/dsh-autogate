@@ -62,6 +62,8 @@ export interface Config {
     readonly showTrail: Volatile<boolean>;
     /** 全自动权限预设键（默认 auto-full）：该预设下审批不再人工弹窗，LLM 裁决为最终决定。 */
     readonly fullAutoPresetName: Volatile<string>;
+    /** 全自动审批拒绝时，是否把具体审查理由回传给 Agent。 */
+    readonly returnDenialReason: Volatile<boolean>;
 }
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     presetName: z<string, string, "volatile-defined">;
@@ -82,6 +84,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     preflight: z<boolean, boolean, "volatile-defined">;
     showTrail: z<boolean, boolean, "volatile-defined">;
     fullAutoPresetName: z<string, string, "volatile-defined">;
+    returnDenialReason: z<boolean, boolean, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
     presetName: z<string, string, "volatile-defined">;
     workspaceRoot: z<string, string, "volatile">;
@@ -101,6 +104,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     preflight: z<boolean, boolean, "volatile-defined">;
     showTrail: z<boolean, boolean, "volatile-defined">;
     fullAutoPresetName: z<string, string, "volatile-defined">;
+    returnDenialReason: z<boolean, boolean, "volatile-defined">;
 }>>, "plain">;
 /**
  * 授权投影单元的单事件转移：记录最近一次「用户真实切换」的权限预设名。

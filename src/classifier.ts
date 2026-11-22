@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
-import type { ClassifierDecision, ClassifierInput, ClassifierTokenUsage, SafetyClassifier } from './types.js'
+import type { ClassifierDecision, ClassifierFailureKind, ClassifierInput, ClassifierTokenUsage, SafetyClassifier } from './types.js'
 import type { UiLocale } from './i18n.js'
 
 /**
@@ -185,6 +185,36 @@ interface LlmStreamRuntime {
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>
 }
 
+/** 结构化故障类别供反馈使用，诊断原文留给日志。 */
+export class ClassifierFailure extends Error {
+  constructor(readonly kind: ClassifierFailureKind, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
+}
+
+const llmFailureKinds = new Map<string, ClassifierFailureKind>([
+  ['TIMEOUT', 'timeout'],
+  ['EMPTY_RESPONSE', 'format'],
+  ['INVALID_RESPONSE', 'format'],
+  ['MALFORMED_RESPONSE', 'format'],
+])
+
+async function runClassifierRequest<T>(signal: AbortSignal, timeoutMs: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const timeout = AbortSignal.timeout(timeoutMs)
+  const combined = AbortSignal.any([signal, timeout])
+  try {
+    combined.throwIfAborted()
+    const result = await run(combined)
+    combined.throwIfAborted()
+    return result
+  } catch (error: unknown) {
+    if (timeout.aborted && combined.reason === timeout.reason) throw new ClassifierFailure('timeout', error)
+    if (signal.aborted || error instanceof ClassifierFailure) throw error
+    const kind = error instanceof LlmError ? llmFailureKinds.get(error.code) : undefined
+    throw new ClassifierFailure(kind ?? 'service', error)
+  }
+}
+
 export function createDshClassifier(runtime: LlmStreamRuntime, config: DshClassifierConfig): SafetyClassifier {
   const overridePair = config.provider !== undefined || config.model !== undefined
   if (overridePair && (config.provider === undefined || config.model === undefined)) {
@@ -202,10 +232,8 @@ export function createDshClassifier(runtime: LlmStreamRuntime, config: DshClassi
       const attempts = config.retryOnFailure === true ? 2 : 1
       let lastParseError: unknown
       for (let attempt = 0; attempt < attempts; attempt += 1) {
-        const timeout = AbortSignal.timeout(config.timeoutMs)
-        const combined = AbortSignal.any([signal, timeout])
         // 流收集阶段的错误（超时 / 中止 / finish 异常 / 请求工具）直接抛出，不重试。
-        const response = await collectResponse(runtime, {
+        const response = await runClassifierRequest(signal, config.timeoutMs, requestSignal => collectResponse(runtime, {
           provider: route.provider,
           model: route.model,
           // 审批分类只做两态裁决，不需要思考：显式 off 让 deepseek-official 等默认思考的适配器发送
@@ -215,8 +243,8 @@ export function createDshClassifier(runtime: LlmStreamRuntime, config: DshClassi
           system: withLocaleDirective(systemPrompt, config.locale?.()),
           temperature: 0,
           maxTokens: config.maxOutputTokens ?? 1024,
-          signal: combined,
-        })
+          signal: requestSignal,
+        }))
         // 仅对模型输出解析失败重试一次（temperature 0 下偶发格式抖动）。
         try {
           const decision = parseClassifierDecision(JSON.parse(jsonText(response.text)))
@@ -225,7 +253,7 @@ export function createDshClassifier(runtime: LlmStreamRuntime, config: DshClassi
           lastParseError = error
         }
       }
-      throw lastParseError
+      throw new ClassifierFailure('format', lastParseError)
     },
   }
 }
@@ -249,24 +277,24 @@ async function collectResponse(runtime: LlmStreamRuntime, options: GenerateOptio
       parts.set(chunk.index, (parts.get(chunk.index) ?? '') + chunk.text)
       size += chunk.text.length
     } else if (chunk.type === 'block-end') {
-      if (chunk.block.type === 'tool-call') throw new Error('classifier unexpectedly requested a tool')
+      if (chunk.block.type === 'tool-call') throw new ClassifierFailure('format', 'classifier unexpectedly requested a tool')
       if (chunk.block.type === 'text') {
         parts.set(chunk.index, chunk.block.text)
         size = [...parts.values()].reduce((total, value) => total + value.length, 0)
       }
     } else if (chunk.type === 'tool-call-delta') {
-      throw new Error('classifier unexpectedly requested a tool')
+      throw new ClassifierFailure('format', 'classifier unexpectedly requested a tool')
     } else if (chunk.type === 'usage') {
       usage = chunk.usage
     } else if (chunk.type === 'finish') {
       finish = chunk.reason
     }
-    if (size > 20000) throw new Error('classifier response is too large')
+    if (size > 20000) throw new ClassifierFailure('format', 'classifier response is too large')
   }
-  if (finish === undefined) throw new Error('classifier response has no finish reason')
-  if (finish.kind === 'error' || finish.kind === 'aborted') throw new Error(finish.failure.message)
-  if (finish.kind === 'max-tokens') throw new Error('classifier response reached its output limit')
-  if (finish.kind === 'tool-calls') throw new Error('classifier unexpectedly requested a tool')
+  if (finish === undefined) throw new ClassifierFailure('format', 'classifier response has no finish reason')
+  if (finish.kind === 'error' || finish.kind === 'aborted') throw LlmError.fromFailure(finish.failure)
+  if (finish.kind === 'max-tokens') throw new ClassifierFailure('format', 'classifier response reached its output limit')
+  if (finish.kind === 'tool-calls') throw new ClassifierFailure('format', 'classifier unexpectedly requested a tool')
   return {
     text: [...parts.entries()].sort(([left], [right]) => left - right).map(([, text]) => text).join(''),
     ...(usage === undefined ? {} : { usage: fromTokenUsage(usage) }),
@@ -333,8 +361,6 @@ export function createHttpClassifier(config: HttpClassifierConfig): SafetyClassi
       const attempts = config.retryOnFailure === true ? 2 : 1
       let lastParseError: unknown
       for (let attempt = 0; attempt < attempts; attempt += 1) {
-        const timeout = AbortSignal.timeout(config.timeoutMs)
-        const combined = AbortSignal.any([signal, timeout])
         // fetch / HTTP 状态错误直接抛出，不重试。
         // 审批分类只做两态裁决：显式发送 reasoning_effort: "none" 关闭思考模式（与 DSH 内部分类器的
         // reasoningEffort off 对齐），避免推理模型默认思考拖慢响应、超过 timeoutMs 导致 fail-closed 误拒。
@@ -349,19 +375,26 @@ export function createHttpClassifier(config: HttpClassifierConfig): SafetyClassi
             { role: 'user', content: JSON.stringify(input) },
           ],
         }
-        const response = await fetch(config.endpoint, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            ...(config.apiKey === undefined ? {} : { authorization: 'Bearer ' + config.apiKey }),
-          },
-          body: JSON.stringify(requestBody),
-          signal: combined,
+        const text = await runClassifierRequest(signal, config.timeoutMs, async requestSignal => {
+          const response = await fetch(config.endpoint, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              ...(config.apiKey === undefined ? {} : { authorization: 'Bearer ' + config.apiKey }),
+            },
+            body: JSON.stringify(requestBody),
+            signal: requestSignal,
+          })
+          if (!response.ok) throw new Error('classifier HTTP ' + response.status)
+          return response.text()
         })
-        if (!response.ok) throw new Error('classifier HTTP ' + response.status)
-        const text = await response.text()
-        if (text.length > 20000) throw new Error('classifier response is too large')
-        const body: unknown = JSON.parse(text)
+        if (text.length > 20000) throw new ClassifierFailure('format', 'classifier response is too large')
+        let body: unknown
+        try {
+          body = JSON.parse(text)
+        } catch (error: unknown) {
+          throw new ClassifierFailure('format', error)
+        }
         // 仅对模型输出解析失败重试一次。
         try {
           const decision = parseClassifierDecision(JSON.parse(responseContent(body)))
@@ -371,7 +404,7 @@ export function createHttpClassifier(config: HttpClassifierConfig): SafetyClassi
           lastParseError = error
         }
       }
-      throw lastParseError
+      throw new ClassifierFailure('format', lastParseError)
     },
   }
 }
